@@ -6,7 +6,6 @@ import uuid
 from java.io import BufferedInputStream
 from java.security import KeyStore, KeyStoreException
 from java.security.cert import CertificateParsingException
-from javax.net.ssl import TrustManagerFactory
 from javax.naming.ldap import LdapName
 from java.lang import IllegalArgumentException, System
 import logging
@@ -19,11 +18,16 @@ import threading
 try:
     # jarjar-ed version
     from org.python.netty.channel import ChannelInitializer
-    from org.python.netty.handler.ssl import SslHandler
+    from org.python.netty.handler.ssl import SslHandler, SslProvider, SslContextBuilder, ClientAuth
+    from org.python.netty.handler.ssl.util import SimpleTrustManagerFactory, InsecureTrustManagerFactory
+    from org.python.netty.buffer import ByteBufAllocator
+
 except ImportError:
     # dev version from extlibs
     from io.netty.channel import ChannelInitializer
-    from io.netty.handler.ssl import SslHandler
+    from io.netty.handler.ssl import SslHandler, SslProvider, SslContextBuilder, ClientAuth
+    from io.netty.handler.ssl.util import SimpleTrustManagerFactory, InsecureTrustManagerFactory
+    from io.netty.buffer import ByteBufAllocator
 
 from _socket import (
     SSLError, raises_java_exception,
@@ -45,15 +49,23 @@ from _socket import (
     error as socket_error)
 
 from _sslcerts import _get_openssl_key_manager, _extract_cert_from_data, _extract_certs_for_paths, \
-    NoVerifyX509TrustManager, _str_hash_key_entry, _get_ecdh_parameter_spec, CompositeX509TrustManager
+    _str_hash_key_entry, _get_ecdh_parameter_spec, CompositeX509TrustManagerFactory
 from _sslcerts import SSLContext as _JavaSSLContext
 
 from java.text import SimpleDateFormat
 from java.util import ArrayList, Locale, TimeZone, NoSuchElementException
 from java.util.concurrent import CountDownLatch
 from javax.naming.ldap import LdapName
+from javax.net.ssl import SSLException, SSLHandshakeException
 from javax.security.auth.x500 import X500Principal
 from org.ietf.jgss import Oid
+
+try:
+    # requires Java 8 or higher for this support
+    from javax.net.ssl import SNIHostName, SNIMatcher
+    HAS_SNI = True
+except ImportError:
+    HAS_SNI = False
 
 log = logging.getLogger("_socket")
 
@@ -65,6 +77,10 @@ OPENSSL_VERSION_INFO = (1, 0, 0, 0, 0)
 _OPENSSL_API_VERSION = OPENSSL_VERSION_INFO
 
 CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED = range(3)
+
+_CERT_TO_CLIENT_AUTH = {CERT_NONE: ClientAuth.NONE,
+                        CERT_OPTIONAL: ClientAuth.OPTIONAL,
+                        CERT_REQUIRED: ClientAuth.REQUIRE}
 
 # Do not support PROTOCOL_SSLv2, it is highly insecure and it is optional
 _, PROTOCOL_SSLv3, PROTOCOL_SSLv23, PROTOCOL_TLSv1, PROTOCOL_TLSv1_1, PROTOCOL_TLSv1_2 = range(6)
@@ -81,10 +97,13 @@ OP_SINGLE_DH_USE, OP_NO_COMPRESSION, OP_CIPHER_SERVER_PREFERENCE, OP_SINGLE_ECDH
 
 VERIFY_DEFAULT, VERIFY_CRL_CHECK_LEAF, VERIFY_CRL_CHECK_CHAIN, VERIFY_X509_STRICT = 0, 4, 12, 32
 
+HAS_TLSv1_3 = False
+
 CHANNEL_BINDING_TYPES = []
 
 # https://docs.python.org/2/library/ssl.html#ssl.HAS_ALPN etc...
-HAS_ALPN, HAS_NPN, HAS_ECDH, HAS_SNI = False, False, True, False
+HAS_ALPN, HAS_NPN, HAS_ECDH = False, False, True
+
 
 # TODO not supported on jython yet
 # Disable weak or insecure ciphers by default
@@ -289,7 +308,6 @@ def get_default_verify_paths():
 
     if java_cert_file is not None and os.path.isfile(java_cert_file):
         cafile = java_cert_file
-        capath = os.path.dirname(java_cert_file)
     else:
         if default_cert_dir_env is not None:
             capath = default_cert_dir_env if os.path.isdir(default_cert_dir_env) else None
@@ -306,7 +324,7 @@ def get_default_verify_paths():
                     capath = os.path.dirname(cafile)
 
     return DefaultVerifyPaths(cafile if os.path.isfile(cafile) else None,
-                              capath if os.path.isdir(capath) else None,
+                              capath if capath and os.path.isdir(capath) else None,
                               'SSL_CERT_FILE', default_cert_file_env,
                               'SSL_CERT_DIR', default_cert_dir_env)
 
@@ -393,7 +411,7 @@ def _create_unverified_context(protocol=PROTOCOL_SSLv23, cert_reqs=None,
 
     All Python stdlib modules shall use this function to create SSLContext
     objects in order to keep common settings in one place. The configuration
-    is less restrict than create_default_context()'s to increase backward
+    is less restricted than create_default_context()'s to increase backward
     compatibility.
     """
     if not isinstance(purpose, _ASN1Object):
@@ -443,17 +461,6 @@ class SSLInitializer(ChannelInitializer):
         pipeline = ch.pipeline()
         pipeline.addFirst("ssl", self.ssl_handler)
 
-class RaceFreeSslHandler(SslHandler):
-    """
-    This is a temporary workaround to solve a race condition that is present in
-    Netty 4.0.33. The race condition causes an NPE because 'this.ctx' isn't set when
-    calling channelActive. Once we upgrade to a version of Netty that fixes the race
-    condition, we should remove this.
-    """
-
-    def channelActive(self, ctx):
-        self.ctx = ctx
-        SslHandler.channelActive(self)
 
 class SSLSocket(object):
 
@@ -465,6 +472,14 @@ class SSLSocket(object):
         self.sock = sock
         self.do_handshake_on_connect = do_handshake_on_connect
         self._sock = sock._sock  # the real underlying socket
+
+        # FIXME in CPython, a check like so is performed - but this is
+        # not quite correct, based on tests. We should revisit to see
+        # if we can make this work as desired.
+
+        # if do_handshake_on_connect and self._sock.timeout == 0:
+        #     raise ValueError("do_handshake_on_connect should not be specified for non-blocking sockets")
+
         self._connected = False
         if _context:
             self._context = _context
@@ -507,30 +522,72 @@ class SSLSocket(object):
 
         self.ssl_handler = None
         # We use _sslobj here to support the CPython convention that
-        # an object means we have handshaked, as used by existing code
-        # in the wild that looks at this ostensibly internal attribute
-        self._sslobj = None
-        self.handshake_count = 0
+        # an object means we have handshaked. It is used by existing code
+        # in the wild that looks at this ostensibly internal attribute.
+        
+        # FIXME CPython uses _sslobj to track the OpenSSL wrapper
+        # object that's implemented in C, with the following
+        # properties:
+        #
+        # 'cipher', 'compression', 'context', 'do_handshake',
+        # 'peer_certificate', 'pending', 'read', 'shutdown',
+        # 'tls_unique_cb', 'version', 'write'
+        self._sslobj = self   # setting to self is not quite right
 
         self.engine = None
 
         if self.do_handshake_on_connect and self._sock.connected:
+            log.debug("Handshaking socket on connect", extra={"sock": self._sock})
             if isinstance(self._sock, ChildSocket):
-                log.debug("Child socket - do not handshake! type=%s parent=%s", type(self._sock), self._sock.parent_socket,
-                          extra={"sock": self._sock})
+                # Need to handle child sockets differently depending
+                # on whether the parent socket is wrapped or not.
+                #
+                # In either case, we cannot handshake here in this
+                # thread - it must be done in the child pool and
+                # before the child is activated.
+                #
+                # 1. If wrapped, this is going through SSLSocket.accept
+
+                if isinstance(self._sock.parent_socket, SSLSocket):
+                    # already wrapped, via `wrap_child` function a few lines below
+                    log.debug(
+                        "Child socket - will handshake in child loop type=%s parent=%s",
+                        type(self._sock), self._sock.parent_socket,
+                        extra={"sock": self._sock})
+                    self._sock._make_active()
+
+                # 2. If not, using code will be calling SSLContext.wrap_socket
+                #    *after* accept from an unwrapped socket
+
+                else:
+                    log.debug("Child socket will wrap self with handshake", extra={"sock": self._sock})
+                    setup_handshake_latch = CountDownLatch(1)
+
+                    def setup_handshake():
+                        handshake_future = self.do_handshake()
+                        setup_handshake_latch.countDown()
+                        return handshake_future
+
+                    self._sock.ssl_wrap_self = setup_handshake
+                    self._sock._make_active()
+                    setup_handshake_latch.await()
+                    log.debug("Child socket waiting on handshake=%s", self._handshake_future, extra={"sock": self._sock})
+                    self._sock._handle_channel_future(self._handshake_future, "SSL handshake")
             else:
                 self.do_handshake()
 
         if hasattr(self._sock, "accepted_children"):
             def wrap_child(child):
-                log.debug("Wrapping child socket - about to handshake! parent=%s", self._sock, extra={"sock": child})
+                log.debug(
+                    "Wrapping child socket - about to handshake! parent=%s",
+                    self._sock, extra={"sock": child})
                 child._wrapper_socket = self.context.wrap_socket(
                     _socketobject(_sock=child),
                     do_handshake_on_connect=self.do_handshake_on_connect,
                     suppress_ragged_eofs=self.suppress_ragged_eofs,
                     server_side=True)
-
                 if self.do_handshake_on_connect:
+                    # this handshake will be done in the child pool - initChannel will block on it
                     child._wrapper_socket.do_handshake()
             self._sock.ssl_wrap_child_socket = wrap_child
 
@@ -538,12 +595,17 @@ class SSLSocket(object):
     def context(self):
         return self._context
 
+    @context.setter
+    def context(self, context):
+        self._context = context
+
     def setup_engine(self, addr):
         if self.engine is None:
             # http://stackoverflow.com/questions/13390964/java-ssl-fatal-error-80-unwrapping-net-record-after-adding-the-https-en
             self.engine = self._context._createSSLEngine(
                 addr, self.server_hostname,
-                cert_file=getattr(self, "certfile", None), key_file=getattr(self, "keyfile", None))
+                cert_file=getattr(self, "certfile", None), key_file=getattr(self, "keyfile", None),
+                server_side=self.server_side)
             self.engine.setUseClientMode(not self.server_side)
 
     def connect(self, addr):
@@ -583,15 +645,21 @@ class SSLSocket(object):
         SSL channel, and the address of the remote client."""
         child, addr = self._sock.accept()
         if self.do_handshake_on_connect:
-            child.active_latch.await()
-
-        log.debug("accepted sock=%s wrapped=%s addr=%s", child, child._wrapper_socket, addr, extra={"sock": self._sock})
-        wrapped_child_socket = child._wrapper_socket
-        del child._wrapper_socket
-        return wrapped_child_socket, addr
+            wrapped_child_socket = child._wrapper_socket
+            del child._wrapper_socket
+            return wrapped_child_socket, addr
+        else:
+            return self.context.wrap_socket(
+                _socketobject(_sock=child),
+                do_handshake_on_connect=self.do_handshake_on_connect,
+                suppress_ragged_eofs=self.suppress_ragged_eofs,
+                server_side=True)
 
     def unwrap(self):
-        self._sock.channel.pipeline().remove("ssl")
+        try:
+            self._sock.channel.pipeline().remove("ssl")
+        except NoSuchElementException:
+            pass
         self.ssl_handler.close()
         return self._sock
 
@@ -601,16 +669,10 @@ class SSLSocket(object):
 
         def handshake_step(result):
             log.debug("SSL handshaking completed %s", result, extra={"sock": self._sock})
-
-            if not hasattr(self._sock, "active_latch"):
-                log.debug("Post connect step", extra={"sock": self._sock})
-                self._sock._post_connect()
-                self._sock._unlatch()
-            self._sslobj = object()  # we have now handshaked
             self._notify_selectors()
 
         if self.ssl_handler is None:
-            self.ssl_handler = RaceFreeSslHandler(self.engine)
+            self.ssl_handler = SslHandler(self.engine)
             self.ssl_handler.handshakeFuture().addListener(handshake_step)
 
             if hasattr(self._sock, "connected") and self._sock.connected:
@@ -621,38 +683,52 @@ class SSLSocket(object):
                 log.debug("Not connected, adding SSL initializer...", extra={"sock": self._sock})
                 self._sock.connect_handlers.append(SSLInitializer(self.ssl_handler))
 
-        handshake = self.ssl_handler.handshakeFuture()
-        time.sleep(0.001)  # Necessary apparently for the handler to get into a good state
+        self._handshake_future = self.ssl_handler.handshakeFuture()
         if isinstance(self._sock, ChildSocket):
+            pass
             # see
             # http://stackoverflow.com/questions/24628271/exception-in-netty-io-netty-util-concurrent-blockingoperationexception
-            # - we are doing this in the handler thread!
-            return
-
-        self._sock._handle_channel_future(handshake, "SSL handshake")
+            # - handshake in the child thread pool
+        else:
+            self._sock._handle_channel_future(self._handshake_future, "SSL handshake")
 
     def dup(self):
-        raise NotImplemented("Can't dup() %s instances" %
+        raise NotImplementedError("Can't dup() %s instances" %
                              self.__class__.__name__)
+
+    @raises_java_exception
+    def _ensure_handshake(self):
+        log.debug("Ensure handshake", extra={"sock": self}) 
+        self._sock._make_active()
+        # nonblocking code should never wait here, but only attempt to
+        # come to this point when notified via a selector
+        if not hasattr(self, "_handshake_future"):
+            self.do_handshake()
+        # additional synchronization guard if this is a child socket
+        self._handshake_future.sync()
+        log.debug("Completed post connect", extra={"sock": self})
 
     # Various pass through methods to the wrapped socket
 
     def send(self, data):
+        self._ensure_handshake()
         return self.sock.send(data)
 
     write = send
 
     def sendall(self, data):
+        self._ensure_handshake()
         return self.sock.sendall(data)
 
     def recv(self, bufsize, flags=0):
+        self._ensure_handshake()
         return self.sock.recv(bufsize, flags)
 
     def read(self, len=0, buffer=None):
         """Read up to LEN bytes and return them.
         Return zero-length string on EOF."""
-
         self._checkClosed()
+        self._ensure_handshake()
         # FIXME? breaks test_smtpnet.py
         # if not self._sslobj:
         #     raise ValueError("Read on closed or unwrapped SSL socket.")
@@ -672,17 +748,21 @@ class SSLSocket(object):
                 raise
 
     def recvfrom(self, bufsize, flags=0):
+        self._ensure_handshake()
         return self.sock.recvfrom(bufsize, flags)
 
     def recvfrom_into(self, buffer, nbytes=0, flags=0):
+        self._ensure_handshake()
         return self.sock.recvfrom_into(buffer, nbytes, flags)
 
     def recv_into(self, buffer, nbytes=0, flags=0):
+        self._ensure_handshake()
         return self.sock.recv_into(buffer, nbytes, flags)
 
     def sendto(self, string, arg1, arg2=None):
         # as observed on CPython, sendto when wrapped ignores the
         # destination address, thereby behaving just like send
+        self._ensure_handshake()
         return self.sock.send(string)
 
     def close(self):
@@ -986,6 +1066,8 @@ class SSLContext(object):
 
         self._key_managers = None
 
+        self._server_name_callback = None
+
     def wrap_socket(self, sock, server_side=False,
                     do_handshake_on_connect=True,
                     suppress_ragged_eofs=True,
@@ -996,38 +1078,47 @@ class SSLContext(object):
                          server_hostname=server_hostname,
                          _context=self)
 
-    def _createSSLEngine(self, addr, hostname=None, cert_file=None, key_file=None):
-        trust_managers = [NoVerifyX509TrustManager()]
-        if self.verify_mode == CERT_REQUIRED:
-            tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+    def _createSSLEngine(self, addr, hostname=None, cert_file=None, key_file=None, server_side=False):
+        tmf = InsecureTrustManagerFactory.INSTANCE
+        if self.verify_mode != CERT_NONE:
+            # XXX need to refactor so we don't have to get trust managers twice
+            stmf = SimpleTrustManagerFactory.getInstance(SimpleTrustManagerFactory.getDefaultAlgorithm())
+            stmf.init(self._trust_store)
+
+            tmf = CompositeX509TrustManagerFactory(stmf.getTrustManagers())
             tmf.init(self._trust_store)
-            trust_managers = [CompositeX509TrustManager(tmf.getTrustManagers())]
 
-        context = _JavaSSLContext.getInstance(self._protocol_name)
-
+        kmf = self._key_managers
         if self._key_managers is None:
-            context.init(
-                _get_openssl_key_manager(
-                    cert_file=cert_file, key_file=key_file).getKeyManagers(),
-                trust_managers, None)
-        else:
-            context.init(
-                self._key_managers.getKeyManagers(),
-                trust_managers, None)
+            kmf = _get_openssl_key_manager(cert_file=cert_file, key_file=key_file)
 
-        if hostname is not None:
-            engine = context.createSSLEngine(hostname, addr[1])
-        else:
-            engine = context.createSSLEngine(*addr)
+        context_builder = None
 
-        # apparently this can be used to enforce hostname verification
-        if hostname is not None and self._check_hostname:
-            params = engine.getSSLParameters()
-            params.setEndpointIdentificationAlgorithm('HTTPS')
-            engine.setSSLParameters(params)
+        if not server_side:
+            context_builder = SslContextBuilder.forClient()
+
+        if kmf:
+            if server_side:
+                context_builder = SslContextBuilder.forServer(kmf)
+            else:
+                context_builder = context_builder.keyManager(kmf)
+
+        context_builder = context_builder.trustManager(tmf)
+        context_builder = context_builder.sslProvider(SslProvider.JDK)
+        context_builder = context_builder.clientAuth(_CERT_TO_CLIENT_AUTH[self.verify_mode])
 
         if self._ciphers is not None:
-            engine.setEnabledCipherSuites(self._ciphers)
+            context_builder = context_builder.ciphers(self._ciphers)
+
+        if self._check_hostname:
+            engine = context_builder.build().newEngine(ByteBufAllocator.DEFAULT, hostname, addr[1])
+            if HAS_SNI:
+                params = engine.getSSLParameters()
+                params.setEndpointIdentificationAlgorithm('HTTPS')
+                params.setServerNames([SNIHostName(hostname)])
+                engine.setSSLParameters(params)
+        else:
+            engine = context_builder.build().newEngine(ByteBufAllocator.DEFAULT, addr[0], addr[1])
 
         return engine
 
@@ -1064,9 +1155,13 @@ class SSLContext(object):
                     if os.path.isfile(possible_cafile):
                         cafiles.append(possible_cafile)
                 elif os.path.isfile(possible_cafile):
-                    with open(possible_cafile) as f:
-                        if PEM_HEADER in f.read():
-                            cafiles.append(possible_cafile)
+                    try:
+                        with open(possible_cafile) as f:
+                            if PEM_HEADER in f.read():
+                                cafiles.append(possible_cafile)
+                    except IOError:
+                        log.debug("Not including %s file as a possible cafile due to permissions error" % possible_cafile)
+                        pass  # Probably permissions related...ignore
 
         certs = []
         private_key = None
@@ -1107,7 +1202,10 @@ class SSLContext(object):
         raise NotImplementedError()
 
     def set_servername_callback(self, server_name_callback):
-        raise NotImplementedError()
+        if not callable(server_name_callback) and server_name_callback is not None:
+            raise TypeError("{!r} is not callable".format(server_name_callback))
+        self._server_name_callback = server_name_callback
+
 
     def load_dh_params(self, dhfile):
         # TODO?

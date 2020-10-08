@@ -482,6 +482,11 @@ def getdefaultlocale(envvars=('LC_ALL', 'LC_CTYPE', 'LANG', 'LANGUAGE')):
 
     """
 
+    if sys.platform.startswith("java"):
+        from java.util import Locale
+        from java.nio.charset import Charset
+        return Locale.getDefault().toString().__str__(), \
+                Charset.defaultCharset().name().__str__()
     try:
         # check if it's supported by the _locale module
         import _locale
@@ -556,7 +561,11 @@ def resetlocale(category=LC_ALL):
     """
     _setlocale(category, _build_localename(getdefaultlocale()))
 
-if sys.platform.startswith("win"):
+if sys.platform.startswith("java"):
+    from java.nio.charset import Charset
+    def getpreferredencoding(do_setlocale = True):
+        return Charset.defaultCharset().name().__str__()
+elif sys.platform.startswith("win"):
     # On Win32, this will return the ANSI code page
     def getpreferredencoding(do_setlocale = True):
         """Return the charset that the user is likely using."""

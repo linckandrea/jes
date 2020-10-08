@@ -21,7 +21,7 @@ from types import MethodType, NoneType
 
 import java
 from java.io import IOException, InterruptedIOException
-from java.lang import Thread, IllegalStateException
+from java.lang import Thread, ArrayIndexOutOfBoundsException, IllegalStateException
 from java.net import InetAddress, InetSocketAddress
 from java.nio.channels import ClosedChannelException
 from java.security.cert import CertificateException
@@ -41,6 +41,8 @@ try:
     from org.python.netty.channel.nio import NioEventLoopGroup
     from org.python.netty.channel.socket import DatagramPacket
     from org.python.netty.channel.socket.nio import NioDatagramChannel, NioSocketChannel, NioServerSocketChannel
+    from org.python.netty.handler.ssl import NotSslRecordException
+
 except ImportError:
     # dev version from extlibs
     from io.netty.bootstrap import Bootstrap, ChannelFactory, ServerBootstrap
@@ -49,7 +51,7 @@ except ImportError:
     from io.netty.channel.nio import NioEventLoopGroup
     from io.netty.channel.socket import DatagramPacket
     from io.netty.channel.socket.nio import NioDatagramChannel, NioSocketChannel, NioServerSocketChannel
-
+    from io.netty.handler.ssl import NotSslRecordException
 
 log = logging.getLogger("_socket")
 log.setLevel(level=logging.WARNING)
@@ -248,7 +250,7 @@ class error(IOError): pass
 class herror(error): pass
 class gaierror(error): pass
 class timeout(error): pass
-class SSLError(error): pass
+class SSLError(error): pass   # FIXME import from ssl, solving the usual mutual import schema
 
 SSL_ERROR_SSL = 1
 SSL_ERROR_WANT_READ = 2
@@ -259,6 +261,7 @@ SSL_ERROR_ZERO_RETURN = 6
 SSL_ERROR_WANT_CONNECT = 7
 SSL_ERROR_EOF = 8
 SSL_ERROR_INVALID_ERROR_CODE = 9
+SSL_UNKNOWN_PROTOCOL = 10   # FIXME check code from OpenSSL
 
 
 def _add_exception_attrs(exc):
@@ -274,7 +277,7 @@ def _unmapped_exception(exc):
 def java_net_socketexception_handler(exc):
     if exc.message.startswith("Address family not supported by protocol family"):
         return _add_exception_attrs(
-            error(errno.EAFNOSUPPORT, 
+            error(errno.EAFNOSUPPORT,
                   'Address family not supported by protocol family: See http://wiki.python.org/jython/NewSocketModule#IPV6_address_support'))
     if exc.message.startswith('Address already in use'):
         return error(errno.EADDRINUSE, 'Address already in use')
@@ -293,7 +296,7 @@ _exception_map = {
     IOException            : lambda x: error(errno.ECONNRESET, 'Software caused connection abort'),
     InterruptedIOException : lambda x: timeout(errno.ETIMEDOUT, 'timed out'),
     IllegalStateException  : lambda x: error(errno.EPIPE, 'Illegal state exception'),
-    
+
     java.net.BindException            : lambda x: error(errno.EADDRINUSE, 'Address already in use'),
     java.net.ConnectException         : lambda x: error(errno.ECONNREFUSED, 'Connection refused'),
     java.net.NoRouteToHostException   : lambda x: error(errno.EHOSTUNREACH, 'No route to host'),
@@ -321,6 +324,12 @@ _exception_map = {
     java.nio.channels.UnsupportedAddressTypeException : None,
 
     SSLPeerUnverifiedException: lambda x: SSLError(SSL_ERROR_SSL, x.message),
+    # FIXME
+    # CPython wraps with a message like so:
+    #   ssl.SSLError: [SSL: UNKNOWN_PROTOCOL] unknown protocol (_ssl.c:590)
+    # Currently this error handler produces this message:
+    #   _socket.SSLError: [Errno 1] not an SSL/TLS record: 48692c2049276d206120636c69656e7421
+    NotSslRecordException: lambda x: SSLError(SSL_UNKNOWN_PROTOCOL, x.message),
 }
 
 
@@ -341,7 +350,17 @@ def _map_exception(java_exception):
             msg = java_exception.message
         py_exception = SSLError(SSL_ERROR_SSL, msg)
     else:
-        mapped_exception = _exception_map.get(java_exception.__class__)
+        # Netty 4.1.6 or higher wraps the connection exception in a
+        # private static class that inherits from ConnectException, so
+        # need to work around.
+        if isinstance(java_exception, java.net.ConnectException):
+            mapped_exception = _exception_map.get(java.net.ConnectException)
+        # Netty AnnotatedNoRouteToHostException extends NoRouteToHostException
+        # so also needs work around.
+        elif isinstance(java_exception, java.net.NoRouteToHostException):
+            mapped_exception = _exception_map.get(java.net.NoRouteToHostException)
+        else:
+            mapped_exception = _exception_map.get(java_exception.__class__)
         if mapped_exception:
             py_exception = mapped_exception(java_exception)
         else:
@@ -354,7 +373,7 @@ def raises_java_exception(method_or_function):
     """Maps java socket exceptions to the equivalent python exception.
     Also sets _last_error on socket objects so as to support SO_ERROR.
     """
-    
+
     @wraps(method_or_function)
     def handle_exception(*args, **kwargs):
         is_socket = len(args) > 0 and isinstance(args[0], _realsocket)
@@ -371,6 +390,22 @@ def raises_java_exception(method_or_function):
             if is_socket:
                 args[0]._last_error = 0
     return handle_exception
+
+def _fsencode(name):
+    """Ensure that a name that may be given as a unicode object (e.g. returned
+    from Java) is converted to the expected bytes representation using the
+    file-system encoding."""
+    if isinstance(name, unicode):
+        return name.encode(sys.getfilesystemencoding())
+    return name
+
+def _fsdecode(name):
+    """Ensure that a name that may be given as a bytes object (normal for
+    Python) is converted to the Unicode representation (e.g for Java) using the
+    file-system encoding."""
+    if isinstance(name, bytes):
+        return unicode(name, sys.getfilesystemencoding())
+    return name
 
 
 # select support
@@ -448,7 +483,7 @@ _PollNotification = namedtuple(
 
 
 class poll(object):
-    
+
     def __init__(self):
         self.queue = LinkedBlockingQueue()
         self.registered = dict()  # fd -> eventmask
@@ -495,7 +530,7 @@ class poll(object):
         if notification is None:
             return None, 0
         mask = self.registered.get(notification.fd, 0)   # handle if concurrently removed, by simply ignoring
-        log.debug("Testing notification=%s mask=%s", notification, mask, extra={"sock": "*"}) 
+        log.debug("Testing notification=%s mask=%s", notification, mask, extra={"sock": "*"})
         event = 0
         if mask & POLLIN and notification.sock._readable():
             event |= POLLIN
@@ -507,14 +542,14 @@ class poll(object):
             event |= POLLHUP
         if mask & POLLNVAL and not notification.sock.peer_closed:
             event |= POLLNVAL
-        log.debug("Tested notification=%s event=%s", notification, event, extra={"sock": "*"}) 
+        log.debug("Tested notification=%s event=%s", notification, event, extra={"sock": "*"})
         return notification.fd, event
 
     def _handle_poll(self, poller):
         notification = poller()
         if notification is None:
             return []
-            
+
         # Pull as many outstanding notifications as possible out
         # of the queue
         notifications = [notification]
@@ -605,10 +640,11 @@ class ChildSocketHandler(ChannelInitializer):
         child.proto = IPPROTO_TCP
         child._init_client_mode(child_channel)
 
-        # Get most current options from the parent. This enables any subsequent divergence.
+        # Get most current options from the parent. This enables any
+        # subsequent divergence.
         #
-        # It's OK that this copy could occur without a mutex, given that such iteration
-        # is guaranteed to be weakly consistent
+        # It's OK that this copy could occur without a mutex, given
+        # that such iteration is guaranteed to be weakly consistent
         child.options = dict(((option, value) for option, value in self.parent_socket.options.iteritems()))
         if child.options:
             log.debug("Setting inherited options %s", child.options, extra={"sock": child})
@@ -616,41 +652,61 @@ class ChildSocketHandler(ChannelInitializer):
             for option, value in child.options.iteritems():
                 _set_option(config.setOption, option, value)
 
-        log.debug("Notifing listeners of parent socket %s", self.parent_socket, extra={"sock": child})
-        self.parent_socket.child_queue.put(child)
-        self.parent_socket._notify_selectors()
-        log.debug("Notified listeners of parent socket %s with queue %s",
-                  self.parent_socket, self.parent_socket.child_queue, extra={"sock": child})
+        # Ensure that this handler will not block if the channel is
+        # closed, otherwise this handler will simply sit idly as a
+        # pending task in the Netty thread pool
+        child_channel.closeFuture().addListener(child._make_active)
 
-        # Must block until the child socket is actually "used". This is
-        # because there may be some additional setup required, such as
-        # wrapping the socket, before the child is ready to read.
+        # Parent socket is wrapping, so we know intent and we can
+        # return as soon as handshaking is completed, if any
+        if hasattr(self.parent_socket, "ssl_wrap_child_socket"):
+            log.debug("Wrapping child socket for a wrapped parent=%s", self.parent_socket, extra={"sock": self})
+            child._wrapper_socket = self.parent_socket.ssl_wrap_child_socket(child)
+            child._handshake_future.sync()
+            child._post_connect()
+            self.parent_socket.child_queue.put(child)
+            log.debug("Notifing listeners of parent socket %s", self.parent_socket, extra={"sock": child})
+            self.parent_socket._notify_selectors()
+            log.debug("Notified listeners of parent socket %s with queue %s",
+                      self.parent_socket, self.parent_socket.child_queue, extra={"sock": child})
+            return
 
-        def unlatch_child(_):
-            # FIXME when bound methods are supported for single method interfaces
-            child._unlatch()
+        # Otherwise, must wait on this barrier until the child socket
+        # is activated, as demonstrated by use or other setup
+        # info. This is because the child may still be OPTIONALLY
+        # wrapped with an SSL socket. Not blocking here will cause
+        # corruption in send/recv data because it will overlap with
+        # the handshaking in that case.
+        with child._activation_cv:
+            def wait_for_barrier():
+                with child._activation_cv:
+                    self.parent_socket.child_queue.put(child)
+                    log.debug("Notifing listeners of parent socket %s", self.parent_socket, extra={"sock": child})
+                    self.parent_socket._notify_selectors()
+                    log.debug("Notified listeners of parent socket %s with queue %s",
+                          self.parent_socket, self.parent_socket.child_queue, extra={"sock": child})
+            self.parent_socket.parent_group.submit(wait_for_barrier)
+            while not child._activated:
+                log.debug("Waiting for optional wrapping", extra={"sock": child})
+                child._activation_cv.wait()
 
-        # Ensure that this handler will not block if the channel is closed,
-        # otherwise this handler will simply sit idly as a pending task in the Netty
-        # thread pool
-        child_channel.closeFuture().addListener(unlatch_child)
-
-        if self.parent_socket.timeout is None:
-            child._ensure_post_connect()
-        child._wait_on_latch()
-        log.debug("Socket initChannel completed waiting on latch", extra={"sock": child})
+        log.debug("Completed waiting for optional wrapping", extra={"sock": child})
+        if hasattr(child, "ssl_wrap_self"):
+            log.debug("Wrapping self", extra={"sock": child})
+            child.ssl_wrap_self()
+        log.debug("Activating child socket by adding inbound handler", extra={"sock": child})
+        child._post_connect()
+        child._channel_is_initialized = True
 
 
 # FIXME raise exceptions for ops not permitted on client socket, server socket
 UNKNOWN_SOCKET, CLIENT_SOCKET, SERVER_SOCKET, DATAGRAM_SOCKET = range(4)
 _socket_types = {
     UNKNOWN_SOCKET:  "unknown",
-    CLIENT_SOCKET:   "client", 
+    CLIENT_SOCKET:   "client",
     SERVER_SOCKET:   "server",
     DATAGRAM_SOCKET: "datagram"
 }
-
-
 
 
 def _identity(value):
@@ -725,10 +781,10 @@ class _realsocket(object):
         self.timeout = _defaulttimeout
         self.channel = None
         self.bind_addr = _EPHEMERAL_ADDRESS
-        self.bind_timestamp = None   # Handle Netty race condition on bound addresses
         self.selectors = CopyOnWriteArrayList()
         self.options = {}  # deferred options until bootstrap
         self.peer_closed = False
+        self.channel_closed = False
 
         # Reference count this underlying socket
         self.open_lock = Lock()
@@ -747,16 +803,19 @@ class _realsocket(object):
         return "<_realsocket at {:#x} type={} open_count={} channel={} timeout={}>".format(
             id(self), _socket_types[self.socket_type], self.open_count, self.channel, self.timeout)
 
-    def _unlatch(self):
-        pass  # no-op once mutated from ChildSocket to normal _socketobject
+    def _make_active(self):
+        pass
 
     def _register_selector(self, selector):
+        self._make_active()  # attempting to poll/select on a socket means waiting for wrap intent is done
         self.selectors.addIfAbsent(selector)
 
     def _unregister_selector(self, selector):
         try:
             return self.selectors.remove(selector)
         except ValueError:
+            return None
+        except ArrayIndexOutOfBoundsException:
             return None
 
     def _notify_selectors(self, exception=None, hangup=False):
@@ -822,7 +881,7 @@ class _realsocket(object):
     # in turn use _connect, which uses Bootstrap, not ServerBootstrap
 
     def _init_client_mode(self, channel=None):
-        # this is client socket specific 
+        # this is client socket specific
         self.socket_type = CLIENT_SOCKET
         self.incoming = LinkedBlockingQueue()  # list of read buffers
         self.incoming_head = None  # allows msg buffers to be broken up
@@ -866,7 +925,6 @@ class _realsocket(object):
 
         self.connect_future = self.channel.connect(addr)
         self._handle_channel_future(self.connect_future, "connect")
-        self.bind_timestamp = time.time()
 
     def _post_connect(self):
         # Post-connect step is necessary to handle SSL setup,
@@ -874,13 +932,15 @@ class _realsocket(object):
         # messages from the peer
         if self.connect_handlers:
             self.channel.pipeline().addLast(self.python_inbound_handler)
-        
-        def peer_closed(x):
+
+        def _peer_closed(x):
             log.debug("Peer closed channel %s", x, extra={"sock": self})
+            self.channel_closed = True
             self.incoming.put(_PEER_CLOSED)
             self._notify_selectors(hangup=True)
 
-        self.channel.closeFuture().addListener(peer_closed)
+        log.debug("Add _peer_closed to channel close", extra={"sock": self}) 
+        self.channel.closeFuture().addListener(_peer_closed)
 
     def connect(self, addr):
         # Unwrapped sockets can immediately perform the post-connect step
@@ -904,7 +964,7 @@ class _realsocket(object):
             if was_connecting:
                 try:
                     # Timing is based on CPython and was empirically
-                    # guestimated. Of course this means user code is
+                    # guesstimated. Of course this means user code is
                     # polling, so the the best we can do is wait like
                     # this in supposedly nonblocking mode without
                     # completely busy waiting!
@@ -959,7 +1019,6 @@ class _realsocket(object):
 
         self.bind_future = b.bind(self.bind_addr.getAddress(), self.bind_addr.getPort())
         self._handle_channel_future(self.bind_future, "listen")
-        self.bind_timestamp = time.time()
         self.channel = self.bind_future.channel()
         log.debug("Bound server socket to %s", self.bind_addr, extra={"sock": self})
 
@@ -983,7 +1042,7 @@ class _realsocket(object):
         return child, peername
 
     # DATAGRAM METHODS
-    
+
     def _datagram_connect(self, addr=None):
         # FIXME raise exception if not of the right family
         if addr is not None:
@@ -1044,7 +1103,7 @@ class _realsocket(object):
         return len(data)
 
     # GENERAL METHODS
-                                             
+
     def close(self):
         with self.open_lock:
             self.open_count -= 1
@@ -1055,29 +1114,28 @@ class _realsocket(object):
             if self.channel is None:
                 return
 
-            try:
-                self.channel.close().sync()
-            except RejectedExecutionException:
-                # Do not care about tasks that attempt to schedule after close
-                pass
-            if self.socket_type == SERVER_SOCKET:
-                log.debug("Shutting down server socket parent group", extra={"sock": self})
-                self.parent_group.shutdownGracefully(0, 100, TimeUnit.MILLISECONDS)
-                self.accepted_children -= 1
-                while True:
-                    child = self.child_queue.poll()
-                    if child is None:
-                        break
-                    log.debug("Closed child socket %s not yet accepted", child, extra={"sock": self})
-                    child.close()
-            else:
-                msgs = []
-                self.incoming.drainTo(msgs)
-                for msg in msgs:
-                    if msg is not _PEER_CLOSED:
-                        msg.release()
+            close_future = self.channel.close()
+            close_future.addListener(self._finish_closing)
 
-            log.debug("Closed socket", extra={"sock": self})
+    def _finish_closing(self, _):
+        if self.socket_type == SERVER_SOCKET:
+            log.debug("Shutting down server socket parent group", extra={"sock": self})
+            self.parent_group.shutdownGracefully(0, 100, TimeUnit.MILLISECONDS)
+            self.accepted_children -= 1
+            while True:
+                child = self.child_queue.poll()
+                if child is None:
+                    break
+                log.debug("Closed child socket %s not yet accepted", child, extra={"sock": self})
+                child.close()
+        else:
+            msgs = []
+            self.incoming.drainTo(msgs)
+            for msg in msgs:
+                if msg is not _PEER_CLOSED:
+                    msg.release()
+
+        log.debug("Closed socket", extra={"sock": self})
 
     def shutdown(self, how):
         log.debug("Got request to shutdown socket how=%s", how, extra={"sock": self})
@@ -1121,7 +1179,7 @@ class _realsocket(object):
         return 0
 
     def _writable(self):
-        return self.channel and self.channel.isActive() and self.channel.isWritable()
+        return self.channel_closed or (self.channel and self.channel.isActive() and self.channel.isWritable())
 
     can_write = _writable
 
@@ -1147,15 +1205,23 @@ class _realsocket(object):
 
         if not self._can_write:
             raise error(errno.ENOTCONN, 'Socket not connected')
-        future = self.channel.writeAndFlush(Unpooled.wrappedBuffer(data))
+
+        bytes_writable = self.channel.bytesBeforeUnwritable()
+        if bytes_writable > len(data):
+            bytes_writable = len(data)
+
+        sent_data = data[:bytes_writable]
+
+        future = self.channel.writeAndFlush(Unpooled.wrappedBuffer(sent_data))
         self._handle_channel_future(future, "send")
-        log.debug("Sent data <<<{!r:.20}>>>".format(data), extra={"sock": self})
-        # FIXME are we sure we are going to be able to send this much data, especially async?
-        return len(data)
-    
+        log.debug("Sent data <<<{!r:.20}>>>".format(sent_data), extra={"sock": self})
+
+        return len(sent_data)
+
     sendall = send   # FIXME see note above!
 
     def _get_incoming_msg(self, reason):
+        log.debug("head=%s incoming=%s" % (self.incoming_head, self.incoming), extra={"sock": self})
         if self.incoming_head is None:
             if self.timeout is None:
                 if self.peer_closed:
@@ -1220,7 +1286,7 @@ class _realsocket(object):
         data, _ = self._get_message(bufsize, "recv")
         log.debug("Received <<<{!r:.20}>>>".format(data), extra={"sock": self})
         return data
-        
+
     def recvfrom(self, bufsize, flags=0):
         self._verify_channel()
         data, sender = self._get_message(bufsize, "recvfrom")
@@ -1402,28 +1468,25 @@ for _m in _socketmethods:
 socket = SocketType = _socketobject
 
 
+# FIXME handshake_future - gates all requests. should be cheap (comparable to the old self.active)
+
 class ChildSocket(_realsocket):
-    
+
     def __init__(self, parent_socket):
         super(ChildSocket, self).__init__(type=parent_socket.type)
         self.parent_socket = parent_socket
-        self.active = AtomicBoolean()
-        self.active_latch = CountDownLatch(1)
+        self._activation_cv = Condition()
+        self._activated = False
         self.accepted = False
         self.timeout = parent_socket.timeout
 
-    def _ensure_post_connect(self):
-        do_post_connect = not self.active.getAndSet(True)
-        if do_post_connect:
-            if hasattr(self.parent_socket, "ssl_wrap_child_socket"):
-                self.parent_socket.ssl_wrap_child_socket(self)
-            self._post_connect()
-            self.active_latch.countDown()
-
-    def _wait_on_latch(self):
-        log.debug("Waiting for activity", extra={"sock": self})
-        self.active_latch.await()
-        log.debug("Latch released, can now proceed", extra={"sock": self})
+    def _make_active(self, *ignore):  # ignore result arg when used as a listener on a future
+        if self._activated:
+            return
+        with self._activation_cv:
+            self._activated = True
+            self._activation_cv.notify()
+        log.debug("Child socket is now activated", extra={"sock": self})
 
     # FIXME raise exception for accept, listen, bind, connect, connect_ex
 
@@ -1433,25 +1496,25 @@ class ChildSocket(_realsocket):
     # connection, not metadata.
 
     def send(self, data):
-        self._ensure_post_connect()
+        self._make_active()
         return super(ChildSocket, self).send(data)
 
     sendall = send
 
     def recv(self, bufsize, flags=0):
-        self._ensure_post_connect()
+        self._make_active()
         return super(ChildSocket, self).recv(bufsize, flags)
 
     def recvfrom(self, bufsize, flags=0):
-        self._ensure_post_connect()
+        self._make_active()
         return super(ChildSocket, self).recvfrom(bufsize, flags)
 
     def setblocking(self, mode):
-        self._ensure_post_connect()
+        self._make_active()
         return super(ChildSocket, self).setblocking(mode)
 
     def close(self):
-        self._ensure_post_connect()
+        self._make_active()
         super(ChildSocket, self).close()
         if self.open_count > 0:
             return
@@ -1464,7 +1527,7 @@ class ChildSocket(_realsocket):
                     self.parent_socket.child_group.shutdownGracefully(0, 100, TimeUnit.MILLISECONDS)
 
     def shutdown(self, how):
-        self._ensure_post_connect()
+        self._make_active()
         super(ChildSocket, self).shutdown(how)
 
     def __del__(self):
@@ -1473,7 +1536,7 @@ class ChildSocket(_realsocket):
         # handler is released when a GC happens, not necessarily
         # before shutdown of course.  Naturally no extra work will be
         # done in setting up the channel.
-        self.active_latch.countDown()
+        self._make_active()
         self.close()
 
 
@@ -1591,7 +1654,7 @@ def _get_jsockaddr(address_object, family, sock_type, proto, flags):
 def _get_jsockaddr2(address_object, family, sock_type, proto, flags):
     # Is this an object that was returned from getaddrinfo? If so, it already contains an InetAddress
     if isinstance(address_object, _ip_address_t):
-        return java.net.InetSocketAddress(address_object.jaddress, address_object[1]) 
+        return java.net.InetSocketAddress(address_object.jaddress, address_object[1])
     # The user passed an address tuple, not an object returned from getaddrinfo
     # So we must call getaddrinfo, after some translations and checking
     if address_object is None:
@@ -1717,7 +1780,12 @@ def getaddrinfo(host, port, family=AF_UNSPEC, socktype=0, proto=0, flags=0):
         hosts = [host]
     results = []
     for h in hosts:
-        for a in java.net.InetAddress.getAllByName(h):
+        try:
+            all_by_name = java.net.InetAddress.getAllByName(h)
+        except java.net.UnknownHostException:
+            raise gaierror(errno.ENOEXEC, 'nodename nor servname provided, or not known')
+
+        for a in all_by_name:
             if len([f for f in filter_fns if f(a)]):
                 family = {java.net.Inet4Address: AF_INET, java.net.Inet6Address: AF_INET6}[a.getClass()]
                 if flags & AI_CANONNAME:
@@ -1820,11 +1888,13 @@ def getfqdn(name=None):
 
 @raises_java_exception
 def gethostname():
-    return str(InetAddress.getLocalHost().getHostName())
+    """Return FS-encoded local host name."""
+    return _fsencode(InetAddress.getLocalHost().getHostName())
 
 @raises_java_exception
 def gethostbyname(name):
-    return str(InetAddress.getByName(name).getHostAddress())
+    """Return IP address as string from FS-decoded host name."""
+    return str(InetAddress.getByName(_fsdecode(name)).getHostAddress())
 
 #
 # Skeleton implementation of gethostbyname_ex
@@ -1994,7 +2064,7 @@ class _fileobject(object):
         return self._sock.fileno()
 
     def write(self, data):
-        data = str(data) # XXX Should really reject non-string non-buffers
+        data = str(data) # XXX Should really reject non-byte non-buffers
         if not data:
             return
         self._wbuf.append(data)

@@ -66,6 +66,12 @@ class TestMain(unittest.TestCase):
     def setup_test_source_trees(self):
         """Setup a test source tree and output destination tree."""
         self.temp_dir = tempfile.mkdtemp()  # tearDown() cleans this up.
+
+        # Make the directory names unicode, in case the temporary directory has
+        # a non-ascii name, since refactor.py uses unicode strings internally.
+        # (Added for Jython but is test failure in CPython 2.7.13 too.)
+        self.temp_dir = self.temp_dir.decode(sys.getfilesystemencoding())
+
         self.py2_src_dir = os.path.join(self.temp_dir, "python2_project")
         self.py3_dest_dir = os.path.join(self.temp_dir, "python3_project")
         os.mkdir(self.py2_src_dir)

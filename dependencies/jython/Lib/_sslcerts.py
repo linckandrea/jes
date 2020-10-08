@@ -4,15 +4,47 @@ import re
 from StringIO import StringIO
 import types
 
-from java.lang import RuntimeException
+from java.lang import RuntimeException, System
 from java.io import BufferedInputStream, BufferedReader, FileReader, InputStreamReader, ByteArrayInputStream, IOException
 from java.security import KeyStore, Security, InvalidAlgorithmParameterException
 from java.security.cert import CertificateException, CertificateFactory
 from java.security.interfaces import RSAPrivateCrtKey
 from java.security.interfaces import RSAPublicKey
-from javax.net.ssl import (
-    X509KeyManager, X509TrustManager, KeyManagerFactory, SSLContext, TrustManager, TrustManagerFactory)
+from javax.net.ssl import X509KeyManager, X509TrustManager, KeyManagerFactory, SSLContext
+
 try:
+    # jarjar-ed version
+    from org.python.netty.handler.ssl.util import SimpleTrustManagerFactory
+
+except ImportError:
+    # dev version from extlibs
+    from io.netty.handler.ssl.util import SimpleTrustManagerFactory
+
+try:
+    # dev version from extlibs OR if in classpath.
+    #
+    # Assumes BC's API is sufficiently stable, but this assumption
+    # seems safe based on our experience using BC.
+    #
+    # This change in import ordering - compared to similar conditional
+    # imports - is to workaround the problem in
+    # http://bugs.jython.org/issue2469, due to the fact that jarjar-ed
+    # jars - like other shading - lose their signatures. For most jars
+    # this is not an issue, and we have been removing signature files
+    # since 2.7.0. But in this specific case, removing signatures then
+    # causes conflicts with Java's security provider model, because it
+    # requires signing.
+    from org.bouncycastle.asn1.pkcs import PrivateKeyInfo
+    from org.bouncycastle.cert import X509CertificateHolder
+    from org.bouncycastle.cert.jcajce import JcaX509CertificateConverter
+    from org.bouncycastle.jce.provider import BouncyCastleProvider
+    from org.bouncycastle.jce import ECNamedCurveTable
+    from org.bouncycastle.jce.spec import ECNamedCurveSpec
+    from org.bouncycastle.openssl import PEMKeyPair, PEMParser, PEMEncryptedKeyPair, \
+        PEMException, EncryptionException
+    from org.bouncycastle.openssl.jcajce import JcaPEMKeyConverter, JcePEMDecryptorProviderBuilder
+    from org.bouncycastle.util.encoders import DecoderException
+except ImportError:
     # jarjar-ed version
     from org.python.bouncycastle.asn1.pkcs import PrivateKeyInfo
     from org.python.bouncycastle.cert import X509CertificateHolder
@@ -20,21 +52,10 @@ try:
     from org.python.bouncycastle.jce.provider import BouncyCastleProvider
     from org.python.bouncycastle.jce import ECNamedCurveTable
     from org.python.bouncycastle.jce.spec import ECNamedCurveSpec
-    from org.python.bouncycastle.openssl import PEMKeyPair, PEMParser, PEMEncryptedKeyPair, PEMException, \
-        EncryptionException
+    from org.python.bouncycastle.openssl import PEMKeyPair, PEMParser, PEMEncryptedKeyPair, \
+        PEMException, EncryptionException
     from org.python.bouncycastle.openssl.jcajce import JcaPEMKeyConverter, JcePEMDecryptorProviderBuilder
-except ImportError:
-    # dev version from extlibs
-    from org.bouncycastle.asn1.pkcs import PrivateKeyInfo
-    from org.bouncycastle.cert import X509CertificateHolder
-    from org.bouncycastle.cert.jcajce import JcaX509CertificateConverter
-    from org.bouncycastle.jce.provider import BouncyCastleProvider
-    from org.bouncycastle.jce import ECNamedCurveTable
-    from org.bouncycastle.jce.spec import ECNamedCurveSpec
-    from org.bouncycastle.openssl import PEMKeyPair, PEMParser, PEMEncryptedKeyPair, PEMException, \
-        EncryptionException
-    from org.bouncycastle.openssl.jcajce import JcaPEMKeyConverter, JcePEMDecryptorProviderBuilder
-
+    from org.python.bouncycastle.util.encoders import DecoderException
 
 log = logging.getLogger("_socket")
 Security.addProvider(BouncyCastleProvider())
@@ -52,7 +73,7 @@ def _get_ca_certs_trust_manager(ca_certs=None):
             for cert in cf.generateCertificates(BufferedInputStream(f)):
                 trust_store.setCertificateEntry(str(uuid.uuid4()), cert)
                 num_certs_installed += 1
-    tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+    tmf = SimpleTrustManagerFactory.getInstance(SimpleTrustManagerFactory.getDefaultAlgorithm())
     tmf.init(trust_store)
     log.debug("Installed %s certificates", num_certs_installed, extra={"sock": "*"})
     return tmf
@@ -107,20 +128,19 @@ def _get_openssl_key_manager(cert_file=None, key_file=None, password=None, _key_
             from _socket import SSLError, SSL_ERROR_SSL
             raise SSLError(SSL_ERROR_SSL, "PEM lib (No private key loaded)")
 
-        keys_match = False
+        keys_match, validateable_keys_found = False, False
         for cert in certs:
             # TODO works for RSA only for now
-            if not isinstance(cert.publicKey, RSAPublicKey) and isinstance(private_key, RSAPrivateCrtKey):
-                keys_match = True
-                continue
+            if isinstance(cert.publicKey, RSAPublicKey) and isinstance(private_key, RSAPrivateCrtKey):
+                validateable_keys_found = True
 
-            if cert.publicKey.getModulus() == private_key.getModulus() \
-                    and cert.publicKey.getPublicExponent() == private_key.getPublicExponent():
-                keys_match = True
-            else:
-                keys_match = False
+            if validateable_keys_found:
+                if cert.publicKey.getModulus() == private_key.getModulus() \
+                        and cert.publicKey.getPublicExponent() == private_key.getPublicExponent():
+                    keys_match = True
+                    break
 
-        if key_file is not None and not keys_match:
+        if key_file is not None and validateable_keys_found and not keys_match:
             from _socket import SSLError, SSL_ERROR_SSL
             raise SSLError(SSL_ERROR_SSL, "key values mismatch")
 
@@ -162,8 +182,10 @@ def _parse_password(password):
 
 def _extract_certs_from_keystore_file(f, password):
     keystore = KeyStore.getInstance(KeyStore.getDefaultType())
-    if password is None:  # default java keystore password is changeit
-        password = 'changeit'
+    if password is None:
+        password = System.getProperty('javax.net.ssl.trustStorePassword')
+        if password is None:  # default java keystore password is changeit
+            password = 'changeit'
     elif not isinstance(password, str):
         password = []
 
@@ -223,6 +245,11 @@ def _extract_cert_from_data(f, password=None, key_converter=None, cert_converter
 
 
 def _read_pem_cert_from_data(f, password, key_converter, cert_converter):
+
+    def PEM_SSLError(err): # Shorthand
+        from _socket import SSLError, SSL_ERROR_SSL
+        return SSLError(SSL_ERROR_SSL, "PEM lib ({})".format(err))
+
     certs = []
     private_key = None
 
@@ -235,8 +262,9 @@ def _read_pem_cert_from_data(f, password, key_converter, cert_converter):
             try:
                 obj = PEMParser(br).readObject()
             except PEMException as err:
-                from _socket import SSLError, SSL_ERROR_SSL
-                raise SSLError(SSL_ERROR_SSL, "PEM lib ({})".format(err))
+                raise PEM_SSLError(err)
+            except DecoderException as err:
+                raise PEM_SSLError(err)
 
             if obj is None:
                 break
@@ -252,8 +280,7 @@ def _read_pem_cert_from_data(f, password, key_converter, cert_converter):
                 try:
                     key_pair = key_converter.getKeyPair(obj.decryptKeyPair(provider))
                 except EncryptionException as err:
-                    from _socket import SSLError, SSL_ERROR_SSL
-                    raise SSLError(SSL_ERROR_SSL, "PEM lib ({})".format(err))
+                    raise PEM_SSLError(err)
 
                 private_key = key_pair.getPrivate()
             else:
@@ -316,7 +343,7 @@ class CompositeX509KeyManager(X509KeyManager):
     
     def getPrivateKey(self, alias):
         for key_manager in self.key_managers:
-            private_key = keyManager.getPrivateKey(alias)
+            private_key = key_manager.getPrivateKey(alias)
             if private_key:
                 return private_key
         return None
@@ -391,14 +418,13 @@ class CompositeX509TrustManager(X509TrustManager):
         return certs
 
 
-# To use with CERT_NONE
-class NoVerifyX509TrustManager(X509TrustManager):
+class CompositeX509TrustManagerFactory(SimpleTrustManagerFactory):
 
-    def checkClientTrusted(self, chain, auth_type):
+    def __init__(self, trust_managers):
+        self._trust_manager = CompositeX509TrustManager(trust_managers)
+
+    def engineInit(self, arg):
         pass
 
-    def checkServerTrusted(self, chain, auth_type):
-        pass
-
-    def getAcceptedIssuers(self):
-        return None
+    def engineGetTrustManagers(self):
+        return [self._trust_manager]

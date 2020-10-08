@@ -588,6 +588,12 @@ def win32_ver(release='',version='',csd='',ptype=''):
         from win32con import HKEY_LOCAL_MACHINE, VER_PLATFORM_WIN32_NT, \
              VER_PLATFORM_WIN32_WINDOWS, VER_NT_WORKSTATION
     except ImportError:
+        if sys.platform.startswith("java"):
+            if os._name == 'nt':
+                unm = os.uname()
+                return unm[2], unm[3], csd, ptype
+            else:
+                return release, version, csd, ptype
         # Emulate the win32api module using Python APIs
         try:
             sys.getwindowsversion
@@ -820,6 +826,10 @@ def mac_ver(release='',versioninfo=('','',''),machine=''):
     if info is not None:
         return info
 
+    if sys.platform.startswith("java") and _java_getprop("os.name", '') == 'Mac OS X':
+        res_release = _java_getprop("os.version", release)
+        return res_release, versioninfo, os.uname()[-1]
+
     # If that also doesn't work return the default values
     return release,versioninfo,machine
 
@@ -827,6 +837,15 @@ def _java_getprop(name,default):
 
     try:
         value = System.getProperty(name)
+        if value is None:
+            return default
+        return newString(value)
+    except AttributeError:
+        return default
+
+def _java_getenv(name,default):
+    try:
+        value = System.getenv(name)
         if value is None:
             return default
         return newString(value)
@@ -1178,12 +1197,72 @@ def uname():
 
         Entries which cannot be determined are set to ''.
 
+
+        Jython-note:
+        platform.uname returns JVM-info.
+        For native platform info use os.uname or platform._uname.
     """
     global _uname_cache
-    no_os_uname = 0
 
     if _uname_cache is not None:
         return _uname_cache
+
+    processor = ''
+
+    node = _node()
+    machine = os.uname()[4]
+
+    # Get JVM-Info:
+    release,vendor,vminfo,osinfo = java_ver()
+    system = 'Java'
+    version = string.join(vminfo,', ')
+    if not version:
+        version = vendor
+
+    if not processor:
+        # Get processor information from the uname system command
+        processor = _uname()[-1]
+
+    #If any unknowns still exist, replace them with ''s, which are more portable
+    if system == 'unknown':
+        system = ''
+    if node == 'unknown':
+        node = ''
+    if release == 'unknown':
+        release = ''
+    if version == 'unknown':
+        version = ''
+    if machine == 'unknown':
+        machine = ''
+    if processor == 'unknown':
+        processor = ''
+
+    _uname_cache = system,node,release,version,machine,processor
+    return _uname_cache
+
+
+# We preserve original uname (more or less) here as _uname:
+_uname_cache2 = None
+
+def _uname():
+
+    """ Fairly portable uname interface. Returns a tuple
+        of strings (system,node,release,version,machine,processor)
+        identifying the underlying platform.
+
+        Note that unlike the os.uname function this also returns
+        possible processor information as an additional tuple entry.
+
+        Entries which cannot be determined are set to ''.
+
+        Jython-note:
+        _uname resembles CPython behavior for debugging purposes etc.
+    """
+    global _uname_cache2
+    no_os_uname = 0
+
+    if _uname_cache2 is not None:
+        return _uname_cache2
 
     processor = ''
 
@@ -1299,8 +1378,11 @@ def uname():
         system = 'Windows'
         release = 'Vista'
 
-    _uname_cache = system,node,release,version,machine,processor
-    return _uname_cache
+    if system == 'Windows' and processor == '':
+        processor = _java_getenv('PROCESSOR_IDENTIFIER',processor)
+
+    _uname_cache2 = system,node,release,version,machine,processor
+    return _uname_cache2
 
 ### Direct interfaces to some of the uname() return values
 
