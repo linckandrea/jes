@@ -22,6 +22,7 @@ tests/test-output/*
 
 # Jython cache
 dependencies/jython/cachedir/
+.jython_cache/
 
 # JES-generated backup and log files
 jmusic.tmp
